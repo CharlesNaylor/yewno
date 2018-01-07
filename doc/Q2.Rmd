@@ -1,0 +1,223 @@
+---
+title: "Q2 Implement Smart Beta Strategy and compare to benchmark"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+# Commodity Curve Smart Beta
+
+I'd like to show a commodity curve strategy. You take futures contracts on a few of the most popular instruments, estimate the price forward curve, then take long positions in the instruments with the most backwardation, and short those with the most contango. Other things being equal, you should be able to collect the carry at the price of exposure to ideosyncratic commodity price movements.
+
+## Gathering Data
+As with everything else, this analysis will be Garbage In, Garbage Out, so the effectiveness of the strategy will depend on the quality of data I can get for free from Quandl. It would be best if I got the full set of historical contracts and chose the appropriate sets for each commodity separately. Some months are more popular than others, especially with agricultural commodities, so it doesn't make sense to naively chain one month after the other. Once again, given time constraints, I'm going to see what we can do with the first and second continuous contracts from Quandl's free source. If I'm not careful, there will also be currency considerations.
+
+```{r}
+library(Quandl)
+library(tidyverse)
+library(lubridate)
+
+SOURCE = "CHRIS/"
+TICKERS <- c(WTI="CME_CL", Gold="CME_GC", Cotton="ICE_CT",
+             NatGas="ICE_M",Wheat="CME_W",Copper="CME_HG",
+             Gasoline="ICE_N",Corn="CME_C")
+
+front_month <- Quandl(paste0(SOURCE,TICKERS,"1"))
+str(front_month[,1:5])
+```
+
+Ugly output. We need to tidy it up and split the columns.
+```{r fm_tidy}
+front_month <- front_month %>% 
+  gather(ticker,value,-Date) %>%
+  drop_na() %>%
+  mutate(series=str_match(ticker,".* - (.*)$")[,2],
+            ticker=str_match(ticker,"CHRIS.(.*)1 - .*")[,2])
+str(front_month)
+```
+
+Now the back month. We're defining that as two months out.
+
+```{r bm}
+back_month <- Quandl(paste0(SOURCE,TICKERS,"2"))
+back_month <- back_month %>% 
+  gather(ticker,value,-Date) %>%
+  drop_na() %>%
+  mutate(series=str_match(ticker,".* - (.*)$")[,2],
+            ticker=str_match(ticker,"CHRIS.(.*)2 - .*")[,2])
+```
+
+Quandl leads me to believe this data is going to need heavy cleanup. Let's take a look. We can filter out all but open and close prices while we're at it.
+```{r}
+fut <- bind_rows(front=front_month, back=back_month, 
+                 .id="contract") 
+fut %>% filter(series=="Last") %>%
+  ggplot(aes(x=Date, y=value, col=contract)) +
+  facet_wrap(~ticker, scales="free", ncol=3) +
+  geom_line(alpha=0.5)
+```
+We are missing several series, at least using closing prices. Copper is basically missing here, too.
+
+Is it just Close? Why are we missing all the ICE series?
+
+```{r}
+fut <- fut %>% filter(Date >= ymd(20080101)) %>%
+  mutate(value = na_if(value, 0)) %>%
+  drop_na()
+
+missing <- c("ICE_CT","ICE_M","CME_HG","ICE_N")
+fut %>% filter(ticker %in% missing) %>%
+  filter(series %in% c("High","Last","Low","Open","Settle")) %>%
+  ggplot(aes(x=Date, y=value, col=contract)) +
+  facet_grid(ticker~series, scales="free_y") +
+  geom_line(alpha=0.5)
+```
+
+Hm. I'm going to replace ICE_M with the CME contract, see if that's better. We're going to need Open values for the backtest, and there's clearly a bunch of bad data in ICE_M.
+
+```{r}
+ng <- Quandl(paste0(SOURCE, "CME_NG", 1:2), start_date="2008-01-01")
+ng <- ng %>% gather(ticker,value,-Date) %>%
+  drop_na() %>%
+  mutate(series=str_match(ticker,".* - (.*)$")[,2],
+         contract=as.numeric(str_match(ticker,"CHRIS.*([1-2]) - .*")[,2]),
+         contract=c("front","back")[contract],
+         ticker=str_match(ticker,"CHRIS.(.*)[1-2] - .*")[,2]) %>%
+  filter(series %in% c("Open", "Last"))
+ng %>% filter(series=="Last") %>%
+  ggplot(aes(x=Date,y=value,col=contract)) +
+  geom_line(alpha=0.5) + ggtitle("CME NatGas")
+```
+
+That's better.
+```{r}
+TICKERS["NatGas"] <- "CME_NG"
+fut <- bind_rows(fut %>% filter(!ticker=="ICE_M"),
+                 ng[,colnames(fut)])
+str(fut)
+```
+
+It looks like ICE contracts need to use Settle, and CME contracts need to use Last. CME_HG needs to use Settle, too, for some reason.
+```{r}
+fut <- bind_rows(fut %>% filter(str_detect(ticker, "^ICE")) %>%
+                   spread(series, value) %>%
+                   mutate(Last=Settle) %>%
+                   gather(series, value, -Date, -ticker, -contract),
+                 fut %>% filter(str_detect(ticker, "^CME")))
+fut <- bind_rows(fut %>% filter(str_detect(ticker, "CME_HG")) %>%
+                   spread(series, value) %>%
+                   mutate(Last=Settle) %>%
+                   gather(series, value, -Date, -ticker, -contract),
+                 fut %>% filter(!str_detect(ticker,"CME_HG")))
+fut %>% filter(series=="Last") %>%
+  ggplot(aes(x=Date, y=value, col=contract)) +
+  facet_wrap(~ticker, scales="free", ncol=3) +
+  geom_line(alpha=0.5)
+```
+
+Ok, from this series we can derive our measure of the curve, plus our quick-and-dirty return measure (which incorporates whatever roll assumptions are built into the CHRIS dataset).
+
+The curve is defined as the log difference of the front and back contracts. Keep in mind, true backwardation is defined as the difference between the forward price and the expected spot at maturity, not the forward price and the forward price further out. This is the price forward curve, which is in contango when future contracts are more expensive. Hence, we want to short the *positive* values of this curve, and long the *negative* ones.
+```{r curve}
+curve <- fut %>% filter(series=="Last") %>%
+  mutate(value=log(value)) %>%
+  spread(contract, value) %>%
+  group_by(ticker) %>%
+  mutate(curve=back-front) %>% 
+  ungroup() %>% select(Date,ticker,curve)
+curve %>% ggplot(aes(x=Date,y=curve)) + facet_wrap(~ticker) +
+  geom_line() + ggtitle("Futures curve estimate")
+```
+
+There are a few holes, and quite likely some artefacts from poor roll decisions on the continuous contract. Again, getting the rolls right is not a trivial problem and well out of the scope of this exercise.
+
+## Smart Beta
+We are going to compare a weighted index of these futures to a generic buy and hold strategy. Ideally, we'd take somebody else's commodity index and build our weights as a variant on the known benchmark.
+
+I'm going to switch to weekly periodicity to help paper over holes in the data. The proper way to backtest would be to create actual accounts and trade to rebalance using VWAP or some other fair estimation of prices on each Friday. Given time constraints, I'm going to cut corners and just weight weekly returns, defined as the difference between the Monday Open and the Friday Close on the front contract. Effectively, the portfolio is selling all its assets each Friday evening, then buying everything back on Monday morning. Not realistic, but it should give us some idea of how this strategy might perform.
+
+```{r weekly}
+weekly_curve <- curve %>% spread(ticker, curve) 
+weekly_curve <- na.locf(zoo(weekly_curve[,-1], weekly_curve$Date)) #Do last observation carry forward to fill in gaps
+weekly_curve <- weekly_curve[wday(index(weekly_curve))==6,]
+weekly_curve <- data.frame(Date=index(weekly_curve),
+                              coredata(weekly_curve)) %>%
+  gather(ticker, curve, -Date)
+weekly_curve %>% ggplot(aes(x=Date,y=curve, col=ticker)) +
+  geom_line(alpha=0.5) + ggtitle("Weekly Curve estimates")
+```
+
+Now for the returns measure we're going to use. This sort of thing is much easier in `pandas`.
+```{r weekly_returns}
+y <- fut %>% filter(series %in% c("Open", "Last")) %>%
+  filter(contract=="front") %>%
+  drop_na() %>% arrange(Date) %>%
+  group_by(format(Date, format="%Y-%U"), ticker) %>%
+  spread(series, value) %>%
+  summarize(Date=last(Date),
+            change=log(last(Last)) - log(first(Open))) %>%
+  ungroup() %>% select(Date, ticker, change)
+# Do na.locf again to make sure the dates are nicely lined up. ICE_CT seems to often not have Friday data.
+y <- y %>% spread(ticker, change) 
+y <- na.locf(zoo(y[,-1], y$Date)) #Do last observation carry forward to fill in gaps
+y <- y[wday(index(y))==6,]
+y <- data.frame(Date=index(y), coredata(y)) %>%
+  gather(ticker, change, -Date)
+y %>% ggplot(aes(x=Date,y=change, col=ticker)) +
+  geom_line(alpha=0.75) + ggtitle("Weekly Returns on Front Contract")
+```
+
+
+### Weighting
+Now, how should we weight the investments? The futures curve as I've defined it is a crude measure, so let's start with a crude weighting. I'll apply a softmax transform to the curve data and compare to the equally- weighted benchmark.
+```{r sigmoid_curve}
+wgts <- weekly_curve %>% group_by(Date) %>%
+  mutate(curve=-curve,
+         softmax=1/(1+exp(-(curve-mean(curve))/sd(curve))),
+         softmax=softmax / sum(softmax),
+         equal=0.125) %>%
+  ungroup()
+wgts %>% 
+  ggplot(aes(x=Date,y=softmax,col=ticker)) + 
+  geom_line(alpha=0.8) + geom_hline(yintercept=0.125, col="grey") +
+  ggtitle("Curve-based Commodity Weights after Softmax",
+          subtitle="Grey line shows equal weight")
+```
+
+## Comparison to Benchmark
+Let's see how the softmax weights compare to an equally-weighted portfolio.
+
+```{r backtest}
+backtest <- full_join(wgts, y, by=c("Date", "ticker")) %>% 
+  group_by(Date) %>%
+  summarize(curve=sum(softmax*change),
+            equal=sum(equal*change))
+backtest %>% mutate(curve=cumsum(curve),
+                    equal=cumsum(equal)) %>% #Cumulative sum since we did returns in log space
+  gather(strategy,value,-Date) %>%
+  ggplot(aes(x=Date,y=value,col=strategy)) + geom_line() +
+  ggtitle("Curve-weighted Commodities Portfolio Vs Equal Weight")
+
+```
+
+This has been brutal 10-year period for commodities, but the curve-weighted portfolio would have saved an investor some pain over a naive equal-weighting. 
+
+Did curve-weighting consistently outperform equal weighting? Or does the cumulative chart look nice due to a few flukes?
+```{r diff_dist}
+backtest %>% transmute(x=curve-equal) %>%
+  ggplot(aes(x=x)) + geom_histogram() +
+  geom_vline(xintercept=0, col="gray") +
+  ggtitle("Distribution of Weekly outperformance of Curve Weighting")
+```
+It looks more like the opposite. A victory of small differences marred by a few blow-ups on the left tail.
+
+How does the volatility compare?
+```{r}
+sd(backtest$curve)
+sd(backtest$equal)
+```
+Practically identical. 
+
+Assuming the results hold up with a more sophisticated backtest (i.e. one that uses actual accounting, holds over the weekend, and takes a stab at estimating slippage), this looks like a viable product if customers could be found who want to take commodity exposure.
+
+It might be interesting to look at a version with net 0 exposure, rather than 100%.
