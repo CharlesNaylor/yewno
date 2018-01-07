@@ -1,0 +1,276 @@
+---
+title: Q1 Use freely available data from the web to predict explain macroeconomic
+  indicators.
+output:
+  html_document: default
+  html_notebook: default
+---
+
+# Q1: Use freely available data from the web to predict/explain macroeconomic indicators.
+
+Financial/Economic/Fundamentals data are not allowed.
+
+```{r setup}
+#Load libraries and show environment
+#Try to install missing libraries if necessary
+necessary_libraries <- c("tidyverse", "lubridate", "gtrendsR", "Quandl", 
+                         "rstan", "GGally", "bayesplot")
+x <- lapply(necessary_libraries, function(x) {
+  if(!require(x, character.only = T)) {
+    install.packages(x)
+    require(x, character.only = T)
+  }
+})
+
+#Rstan settings
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+R.version 
+```
+
+## Some Caveats
+
+Most interesting or creative data sets require a lot of clean-up. Even starting with data from Bloomberg, I find processing takes about half the total time for a project. Given the time constraints on this one, I'm going to focus on options that should already be pretty clean.
+
+Additionally, there's a big distinction between predicting macroeconomic indicators *as reported in the historical timeseries*, and making predictions on the data *as reported on the day*. Many indicators are subject to substantial revisions, sometimes months later. If we're targeting a signal on which we want to trade, we need to use the initial data, plus revisions to that data and the dates of those revisions in order to avoid looking into the future on our backtest. This question doesn't mention tying the indicators to asset price movements, so I'll just use the final numbers as reported in FRED, not the historical series from ALFRED.
+
+# Search Traffic as an explanatory variable
+
+For our exogenous variables, let's try using search popularity from the Google Analytics API. I could see this working well for a few indicators.
+
+# Initial Claims (for unemployment)
+
+We could reasonably expect that newly unemployed people don't have the major job sites bookmarked yet, and rely on typing their names directly into the search bar. Therefore, we might expect to see a relative upsurge in these searches if a lot of people have recently been laid off. 
+
+Some potential problems with this approach:
+
+1) Google Trends data goes back to 2004, and this behavior of searching for everything rather than guessing at URLs wasn't as common at the beginning of the period. It was really after the advent of Google Chrome and the merging of the search and the address bar that this would be standard.
+
+2) Popularity of different job sites waxes and wanes. We'd need to separate the overall trend from the monthly variations. 
+
+3) Unemployment is seasonal, so after removing the overall trend we'll have an additional month-of-the-year cycle. We could possibly ignore this by using the NSA (not seasonally-adjusted) claims series and expecting the cycles to match.
+
+4) Some of the big job sites have fairly generic names. There are probably a lot of confounding searches on "monster" or "dice". Maybe adding ".com" to those is justifiable.
+
+5) For production, we would need to check what sort of delay Google Trends reporting has. Is it instantaneous?
+
+## Gathering Data
+
+### Exogenous variable
+Google Trend data.
+```{r get_trend}
+jobs_trends <- gtrends(c("linkedin", "monster.com", "indeed", "careerbuilder", "dice.com"),
+                       geo="US",
+                       time="all")$interest_over_time
+str(jobs_trends)
+```
+
+Let's take a look at the data.
+```{r graph_trend, fig.height=5, fig.width=8.05}
+jobs_trends %>% ggplot(aes(x=date,y=hits, col=keyword)) + 
+  geom_line() + ggtitle("Job site search trends") 
+```
+Apparently nobody searches for dice.com. Wikipedia tells me that the top three job sites are Monster, CareerBuilder, and Indeed, but you wouldn't know it from these trends. Should we use searches for Monster instead of Monster.com?
+```{r graph_trend_mcom, fig.height=5, fig.width=8.05}
+jobs_trends <- gtrends(c("linkedin", "monster", "monster.com", "indeed", "careerbuilder"),
+                       geo="US",
+                       time="all")$interest_over_time
+jobs_trends %>% ggplot(aes(x=date,y=hits, col=keyword)) + 
+  geom_line() + ggtitle("Job site search trends") 
+```
+It's difficult to see if the "monster" trends are similar. I'm also not seeing much of a spike around the financial crisis. I'll need to do the de-trending step before we can be sure. 
+
+Let's make sure we have good Initial Claims data before continuing. 
+```{r initial_claims}
+# I could be using Quandl's date aggregation here to get to monthly, but I'd prefer to do it myself.
+ic <- Quandl("FRED/ICNSA", start_date="2004-01-01", end_date="2018-01-01")
+str(ic)
+```
+Right, Initial Claims are reported weekly. We only have monthly data from Google Trends. Weekly to monthly is not a clean aggregation, as some months will include 5 weeks and some 4. It would be better if we could get weekly Trends. Can I break my query into chunks and get weekly data?
+
+```{r chunked_gtrends, fig.height=5, fig.width=8.05}
+date_chunks <- c("2004-01-01 2007-12-31", "2008-01-01 2012-12-31", "2013-01-01 2017-12-31")
+
+jobs_trends <- date_chunks %>% map_dfr(function(dt) {
+  gtrends(c("linkedin", "monster", "monster.com", "indeed", "careerbuilder"),
+                       geo="US", time=dt)$interest_over_time})
+jobs_trends %>% ggplot(aes(x=date,y=hits, col=keyword)) + 
+  geom_line() + ggtitle("Weekly Job site search trends") 
+```
+Yes.
+
+Ok, now we need to de-trend the search trends. The final statistical model should take the raw data and do the de-trending directly in the code, but we're still exploring now.
+
+Keeping things simple first, let's look at these as differences. Normally, I'd do difference of logs, but these values are already percentages, and we have zeros. Not that in other circumstances I'd have any qualms about just adding 1 to the series so I could take logs.
+```{r detrend, fig.height=5, fig.width=8.05}
+#dplyr's implementation of lead and lag is dangerous when combined with group_by. The commented out code doesn't work, and removing the 'order_by' leads to an answer that's mostly right, but includes bleed in between groups! Best to move it out of tidy format to be safe.
+
+# jobs_dT <- jobs_trends %>% select(date,hits,keyword) %>%
+#   group_by(keyword) %>% 
+#   transform(dT=hits-dplyr::lag(hits, order_by=date)) 
+jobs_dT <- jobs_trends %>% select(date, hits, keyword) %>%
+  spread(keyword, hits) %>%
+  mutate_at(vars(-date), funs(. - lag(.))) %>%
+  gather(keyword, dT, -date) %>%
+  drop_na()
+
+jobs_dT %>% ggplot(aes(x=date,y=dT, col=keyword)) + 
+  geom_line(alpha=0.75) + scale_color_brewer(palette="Set3") +
+  ggtitle("Relative trends")
+```
+We are left with a scaling problem, as changes in 'monster', are relatively larger than changes in, say, 'careerbuilder', even though the relative magnitude might be similar. Let's have a quick peek at the distributions.
+```{r detrend_dist, fig.height=2.5, fig.width=8.05}
+jobs_dT %>% ggplot(aes(x=dT, col=keyword)) + geom_density() + 
+  ggtitle("Kernel density of trend differences by keyword")
+```
+The differences in scale are clear. I also don't like the tri-modality of 'monster.com', which is likely due to rounding on small values. We might want to ditch that one, or alternately add it to 'monster'.
+
+We could fix this by dividing by a scalar constant, but I'd prefer to push as much calculation as possible into the model, as that will make the process more robust if we need to update this model regularly.
+
+We should check the covariance of the Trends, too. If my hypothesis is correct, they ought to be collinear.
+```{r ggcorr}
+jobs_dT %>% spread(keyword,dT) %>% select(-date) %>% ggcorr(label=T, label_alpha=T)
+```
+These are fairly strong. I need to come up with a way to combine the various Trends, as they are of different utility over time. E.g. LinkedIn and Indeed really only came into their own in the last few years.
+
+### Endogenous variable
+We already fetched this. Weekly Initial Jobless Claims from FRED. Let's take a look at the graph.
+```{r endo, fig.height=5, fig.width=8.05}
+ic %>% ggplot(aes(x=Date,y=Value)) + geom_line() + 
+  ggtitle("Weekly Initial Jobless Claims, NSA")
+```
+We have a strong annual cycle, and you can clearly see the credit crisis and subsequent recovery. The cycle looks significantly larger as a percentage of recent values than what we saw in the Google Trends data, which is worrisome.
+
+I plan on doing the regression using generative modeling in Stan, so I'll need to center and scale this data. Let's have a look at difference of logs, which should leave the cycle intact. You might argue that Initial Claims is already differenced, in that it represents the change in unemployement, but we are using the Trend searches as a proxy for the *newly* unemployed, on the assumption that the chronically unemployed will use bookmarks or the Chrome home page to go straight to the websites without searching.
+
+```{r}
+#not worth calling tidy functions for this
+ic_dT <- with(ic[order(ic$Date),], data.frame(date=Date[-1],dT=diff(log(Value))))
+ic_dT %>% ggplot(aes(x=date,y=dT)) + geom_line() + ggtitle("Change in Initial Claims")
+```
+That's something you can put a decent prior against.
+
+Do the weekly dates line up between series?
+```{r}
+unique(wday(ic_dT$date))
+unique(wday(jobs_dT$date))
+```
+No. We need to be very careful that we get this going the correct way, or we'll have our endo and exog weeks misaligned. The most recent weekly value for jobs_dT is a Sunday, and today (2018-01-06) is Saturday, so we can say Google ends weeks on Sunday. FRED explicitly says they end weeks on Saturday. So we need to add a day to ic_dT$date.
+```{r}
+ic_dT <- ic_dT %>% transform(date=date + days(1)) #not actually necessary to use the lubridate days function, but good practice.
+jobs_dT <- jobs_dT %>% transform(date=as.Date(date)) #Get dates into the same class across objects
+```
+
+## Trend Differences as an explanatory variable for Initial Claims
+
+Let's see if the difference in google Trend values for these searches has any explanatory power for contemporaneous values of Initial Claims. We prefer prediction for actual investment strategies, but for indicators for which there may be significant revisions, this regression can have value, too.
+
+We should take an initial look at the scatter plot.
+```{r scatter}
+x <- bind_rows(ic_dT %>% mutate(keyword="Initial_Claims"),
+          jobs_dT %>% mutate(dT=dT/100)) #Get everything on the same scale
+x %>% spread(keyword, dT) %>% 
+  gather(keyword, dT, -date, -Initial_Claims) %>% #split out Initial Claims for the graph
+  ggplot(aes(x=dT, y=Initial_Claims, col=keyword)) +
+  geom_point(alpha=0.5) + ggtitle("Initial Claims vs. Contemporaneous Searches for Job Sites")
+```
+On the basis of that graph, I wouldn't expect we'll find much of a relationship here. Let's look at them individually. 
+
+```{r scatter_facet}
+x <- bind_rows(ic_dT %>% mutate(keyword="Initial_Claims"),
+          jobs_dT %>% mutate(date=as.Date(date), dT=dT/100)) #Get everything compatible
+x %>% spread(keyword, dT) %>% 
+  gather(keyword, dT, -date, -Initial_Claims) %>% #split out Initial Claims for the graph
+  ggplot(aes(x=dT, y=Initial_Claims)) + facet_wrap(~keyword) +
+  geom_point(alpha=0.5) + ggtitle("Initial Claims vs. Contemporaneous Searches for Job Sites")
+```
+
+If I'm seeing anything, the relationship might run the other way, but I could be fooled by outliers in a crowded plot. Hopefully we agree the purpose of these questions is to demonstrate process and competence, not actionable strategies.
+
+### Model Choice
+
+A straight-forward OLS isn't appropriate with the data in its current form, because if my hypothesis is right, the Trends ought to be collinear. The simplest solution would be to combine the separate Trends into a single indicator before performing any regression. Without further normalization, the `monster` Trend will dominate early values in the regression. There is some appeal to this type of index, though, as Trends that only became significant halfway through the dataset, like Indeed, might actually get a more effective beta as part of a Trend index than if I estimate it separately and try to account for its varying popularity in the model.
+
+Since I'm pressed for time, I'm going to regress an index only. It might make sense to try a a hierarchical regression with keyword-level beta variance to account for the different scales of trends, but then we would need to account for the covariance of trends directly in the model. Another idea to explore might use some sort of time-weighting on the individual trends in order to account for the changing relevance of the job sites.
+
+#### OLS with a single estimator index
+If I were going to code the harder models mentioned above, I'd need to use [Stan](mc-stan.org). It would therefore make sense to do even the simple regression that way so that we can take advantage of built-in model comparison tools. But first let's just do a closed-form OLS on the sum of the trend changes.
+```{r agg_trend, fig.height=5, fig.width=8.05}
+agg_data <- full_join(jobs_dT %>% group_by(date) %>% summarize(trend=sum(dT)/100),
+          ic_dT,
+          by="date")
+agg_data %>% ggplot(aes(x=trend,y=dT)) + geom_point(alpha=0.5) + geom_smooth(method="lm") +
+  ggtitle("Change in Initial Claims vs. Aggregate Trend")
+```
+As I thought, a weak negative relationship. This is not a good candidate.
+```{r ols}
+summary(lm(dT~trend, data=agg_data))
+```
+Normally, I'd go back to the drawing board here, but as this is meant to be a demonstration of process, let's see it through. We can at least see that a generative model is calibrated correctly.
+
+As this is time series data, it's sensible to reserve the last period for validation. We need at least a year given the seasonality of the series.
+
+Here's the model code:
+```{r}
+cat(read_file("../yewno/ols.stan"))
+```
+
+```{r ols_stan, message=FALSE, warning=FALSE}
+stan_ols <- stan_model(model_name="ols", file="../yewno/ols.stan")
+N2 <- 52 #How much data to keep back for posterior predictive check (i.e. validation)
+N <- nrow(agg_data)-N2
+fit_ols <- rstan::sampling(stan_ols, data=with(agg_data, list(N=N, N2=N2,
+                                                   y=dT[1:N],
+                                                   x=trend[1:N],
+                                                   x2=trend[(N+1):(N+N2)],
+                                                   y2=dT[(N+1):(N+N2)]))
+)
+```
+
+Check convergence quickly
+```{r ols_stan_convergence}
+print(rhat(fit_ols, pars=c("alpha", "beta", "sigma", "lp__"))) #variance of samples within-chain to pooled sample variance. Must be close to 1.
+```
+Good.
+
+Let's look at the posterior predictive check.
+```{r ols_stan_ppc}
+#sample 500 iterations
+iter_samples <- sample(1:4000,500) #we get 4000 iterations because there were 4 chains iterated 2000 times, and we threw away the first half of iterations as warm-up.
+data.frame(date=agg_data$date[(N+1):(N+N2)],
+           y=agg_data$dT[(N+1):(N+N2)],
+           t(extract(fit_ols, pars="y_hat")$y_hat[iter_samples,])) %>%
+  gather(iteration,value, -date, -y) %>% 
+  ggplot(aes(x=date)) + geom_line(aes(y=value,group=iteration), col="coral", alpha=0.25) +
+  geom_line(aes(y=y), col="black", size=1.5) +
+  ggtitle("Actual Y values vs. Predicted")
+```
+The model is well-calibrated, in that only one point in 52 in the validation period is close to or out of the range of predicted values. We have an accurate, if not particularly useful, model.
+
+Let's look at the median $\hat{y}$ versus the actual y. This will not look good.
+```{r ols_prediction}
+ols_med <- data.frame(date=agg_data$date[(N+1):(N+N2)],
+             y=agg_data$dT[(N+1):(N+N2)],
+             y_hat=apply(extract(fit_ols, pars="y_hat")$y_hat,2,median))
+#Set tolerance to be within 0.05 of the data on either side
+tol <- 0.05
+with(ols_med,sum(abs(y-y_hat) < tol)/N2)
+```
+
+So we only got within 0.05 of the actual value about a third of the time. Let's see if we do any better modelling the trend beta variances separately.
+
+```{r}
+write_csv(ols_med, path="../data/Q1_median_test.csv")
+
+data.frame(date=agg_data$date[(N+1):(N+N2)],
+           y=agg_data$dT[(N+1):(N+N2)],
+           t(extract(fit_ols, pars="y_hat")$y_hat)) %>%
+  gather(iteration,value, -date, -y) %>% 
+  write_csv(path="../data/Q1_full_posterior_test.csv")
+```
+
+
+# Conclusions
+
+It doesn't look like there is much explanatory value in these job-site search trends for initial claims data. As I mentioned in the model choice section, we could try to impose more structure on the model to eke out a better performance, but we would then need to handle the covariance of the trends, and given the low power of the regression, I'm not convinced that this is a sensible option in comparison to simply manually aggregating them. The transformed data did not look particularly nonlinear, so BART or Gaussian Processes will not likely improve the fit either.
