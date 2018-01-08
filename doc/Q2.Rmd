@@ -147,7 +147,7 @@ weekly_curve %>% ggplot(aes(x=Date,y=curve, col=ticker)) +
   geom_line(alpha=0.5) + ggtitle("Weekly Curve estimates")
 ```
 
-Now for the returns measure we're going to use. This sort of thing is much easier in `pandas`.
+Now for the returns measure we're going to use. This sort of thing is much easier in `pandas`. I won't be doing difference of logs here because we will be using these returns in a weighted sum.
 ```{r weekly_returns}
 y <- fut %>% filter(series %in% c("Open", "Last")) %>%
   filter(contract=="front") %>%
@@ -155,7 +155,7 @@ y <- fut %>% filter(series %in% c("Open", "Last")) %>%
   group_by(format(Date, format="%Y-%U"), ticker) %>%
   spread(series, value) %>%
   summarize(Date=last(Date),
-            change=log(last(Last)) - log(first(Open))) %>%
+            change=last(Last)/ first(Open) -1) %>% 
   ungroup() %>% select(Date, ticker, change)
 # Do na.locf again to make sure the dates are nicely lined up. ICE_CT seems to often not have Friday data.
 y <- y %>% spread(ticker, change) 
@@ -192,8 +192,8 @@ backtest <- full_join(wgts, y, by=c("Date", "ticker")) %>%
   group_by(Date) %>%
   summarize(curve=sum(softmax*change),
             equal=sum(equal*change))
-backtest %>% mutate(curve=cumsum(curve),
-                    equal=cumsum(equal)) %>% #Cumulative sum since we did returns in log space
+backtest %>% mutate(curve=cumprod(1+curve)-1,
+                    equal=cumprod(1+equal)-1) %>% #Cumulative product since returns are not in log-space
   gather(strategy,value,-Date) %>%
   ggplot(aes(x=Date,y=value,col=strategy)) + geom_line() +
   ggtitle("Curve-weighted Commodities Portfolio Vs Equal Weight")

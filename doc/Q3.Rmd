@@ -1,0 +1,261 @@
+---
+title: "Q3 - FX Prediction"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+# FX Prediction
+
+For a long time, the primary driver of currency returns in the medium term has expectations of changes in interest rates. The theory of uncovered interest rate parity does not hold, and until the credit crisis many traders and funds made a fairly good living on that fact via the carry trade, in which an investor borrows in a currency with a low interest rate, lends in a currency with a high interest rate, and collects the difference in return for exposing himself to potential adverse moves in spot rates. This trade is powerful enough that emerging economies which try to slow down their economies by tightening credit conditions could instead find inflation exacerbated by influxes of foreign direct investment.
+
+The appeal of the carry trade has broken down somewhat in recent years, however, as rates dropped to zero throughout the developed world, then dropped below zero. The logic of carry would say, for example, that the Yen should have weakened in early 2016 when the BoJ announced they would target negative interest rates. Instead, the Yen strengthened for 6 straight months. Similarly, the Euro has been rallying against the US Dollar on the news that the ECB will taper its quantitative easing, even thoug the US Fed has actually been hiking interest rates in the same period.
+
+The upshot is that major currency pairs have become difficult to forecast on the basis of traditional fundamental factors. I have a demo of a Gaussian Process regression for forecasting FX returns on [this same github account](charlesnaylor.github.io/gp_regression) if you'd like to hear me fulminate more on the subject.
+
+It's therefore with some trepidation that I approach this question. A lot of the tried-and-true factor-based approaches to forecasting FX have been falling by the way-side these past few years. An investor might have more luck narrowing her time frame and focusing on momentum indicators instead.
+
+Nonetheless, while there may be few general factors in the offing these days, some currencies should still react strongly to changes in specific commodity prices. Norway, Canada, and Russia are major energy exporters, and so changes in the spot price of oil and natural gas definitely affect the spot price of their currencies. Australia exports lots of coal and iron ore, and so changes in industrial metals indexes may have an impact on the AUD. 
+
+The difficulty with using commodity prices to forecast currency spot rates is that we have simply shifted the ground. Relevant currencies react very quickly to commodity price changes, so essentially we will need to forecast the commodities accurately to gain an edge.
+
+# Energy Price Momentum vs Energy Export Currencies
+Let's try an energy momentum indicator based on prices of Brent Oil and Natural Gas as a factor to forecast NOK, CAD, and RUB. 
+
+I'll use spot rates for currencies, although an institutional investor would expect to collect the short-term interest rate from holding a currency. It might be worth it to redo the analysis using futures contracts.
+
+## Gathering Data
+
+Timing is a critical factor for currency markets, as trading starts in Asian markets on Sunday evening (EST), and doesn't finish until the US markets close on Friday evening. The standard spot benchmark is usually the WM/Reuters fix at 4PM GMT. Depending on the trading strategy, it can be easier to reduce data to weekly periodicity to avoid having to think about time zones. Quandl gives me no information about where and when their spot rates are fixed. For this exercise I'll pretend we know the data is lined up correctly with the daily commodity spot prices.
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(Quandl)
+library(broom)
+
+FX_SOURCE = "CURRFX/"
+FX_TICKS = c("NOKUSD", "NOKSEK", "CADUSD", "RUBUSD") #I'm including Swedish Krona because the NOKSEK pair might react more purely to changes in energy than NOKUSD. 
+
+NRG_SOURCE = "EIA/" #Spot prices instead of futures this time
+NRG_TICKS = c(WTI="PET_RWTC_D", Brent="PET_RBRTE_D", HenryHub="NG_RNGWHHD_D")
+#I'm having difficulty finding a free source of spot prices for Natural Gas in Europe. Now that we there is a live LNG market, perhaps Henry Hub will do for Europe as well.
+
+fx <- Quandl(paste0(FX_SOURCE, FX_TICKS), start_date="2008-01-01")
+nrg <- Quandl(paste0(NRG_SOURCE, NRG_TICKS), start_date="2007-01-01") # Start a year earlier so I have lee-way for making my momentum indicator.
+```
+
+Ok, let's see what we got.
+
+```{r raw_graph}
+fx <- fx %>% select(Date, ends_with("Rate")) %>%
+  rename_at(vars(-Date), funs(str_match(., "CURRFX.([A-Z]{6}).*")[,2])) %>%
+  gather(ticker,spot,-Date)
+fx %>% ggplot(aes(x=Date,y=spot)) + facet_wrap(~ticker, scales="free_y") +
+  geom_line() + ggtitle("FX Spot rates from Quandl")
+```
+We have quite a few gaps and some obvious errors in NOKUSD towards the beginning of the period. I'm going to start the data at 2010 and do last observation carry forward.
+
+```{r fix_fx}
+fx <- fx %>% filter(Date >= ymd(20100101)) %>%
+  group_by(ticker) %>% mutate(spot=na.locf(spot)) %>%
+  ungroup()
+fx %>% ggplot(aes(x=Date,y=spot)) + facet_wrap(~ticker, scales="free_y") +
+  geom_line() + ggtitle("FX Spot rates from Quandl")
+```
+That's better. I see some fuzziness in all these series that's probably poor data rather than bouts of volatility, however.
+
+On to the energy spots.
+```{r nrg_raw_graph, fig.height=2.5, fig.width=8.05}
+nrg <- nrg %>% rename_at(vars(-Date), funs(str_match(., "EIA.(.*) -.*$")[,2])) %>%
+  rename_at(vars(-Date), funs(names(NRG_TICKS)[which(NRG_TICKS==.)])) %>%
+  gather(ticker, spot, -Date)
+nrg %>% ggplot(aes(x=Date,y=spot)) + facet_wrap(~ticker, scales="free_y") +
+  geom_line() + ggtitle("FX Spot rates from Quandl")
+```
+The spike in HenryHub is due to the current freeze on the East coast. Data looks pretty good, especially by Quandl's standards.
+
+## Momentum Indicator
+As I mentioned in the introduction, to the extent that a given currency is sensitive to energy prices, they tend to react pretty quickly. This analysis is not in a position to test getting in ahead of those investors. Instead, I'm going to construct simple momentum indicator for energy prices. I'll use a combination of Brent (i.e. North Sea oil prices) and HenryHub for NOK and RUB, and WTI (i.e. Cushing, OK oil prices) and HenryHub for CAD. There shouldn't be a huge difference between Brent and WTI movements, but the spread does move around. There are large structural differences between natural gas prices in the US and elsewhere, because it costs something like $2 to liquify and ship natural gas (LNG). I'm not an energy guy, but I read that European spot prices are increasingly tied to the movement of the Henry Hub price in Louisiana due to the increasing availability of LNG in the market, even if the price levels aren't identical. It'll have to do, anyway, as I couldn't find a good daily spot price for Europe for free. I'd note that Russian natural gas is typically supplied under long-term contracts at a price derived from the price of crude oil, anyway.
+
+To make our indicator, we'll need to normalize the spot prices on a rolling basis, then combine them. As in Q1, I'm tempted to model the parameters for the normalization directly in the regression. My guess is that the signal-to-noise ratio for this factor is going to be pretty low, and hence those parameters would be poorly identified.
+
+Instead, I'm going to use an arbitrary exponential moving average (EWMA) with a 10-day half-life. A more thorough analysis would begin by testing the utility of some alternate momentum transformations in predicting the energy spot prices. We don't have time for that in this exercise.
+
+Unlike in pandas, we don't have a rolling EWMA window on the shelf with R. Rolling windows in general are poorly supported in the new 'tidyverse' standard, so I'm going to switch to zoo.
+```{r ewma, fig.height=2.5, fig.width=8.05} 
+ewma <- function(x, lambda=10) {
+  alpha <- (1 - exp(log(0.5)/lambda))
+  return(c(stats::filter(x * alpha, 1 - alpha, "recursive", init = x[1])))
+}
+
+nrg %>% drop_na() %>% group_by(ticker) %>%
+  mutate(ewma=lead(ewma(spot))) %>% #Note we're leading this so that it can be a predictor for spot.
+  ungroup() %>% 
+  gather(series, value, -Date, -ticker) %>%
+  mutate(series=factor(series, levels=c("spot", "ewma"))) %>% #reverse series factor order
+  ggplot(aes(x=Date,y=value, col=series)) + facet_wrap(~ticker) + geom_line(alpha=0.5)
+```
+
+Looks like a reasonable EWMA implementation. The momentum indicator will be the log-difference between the EWMA and spot.
+```{r}
+mo <- nrg %>% drop_na() %>% group_by(ticker) %>%
+  mutate(momentum=log(spot)-lead(log(ewma(spot)))) %>% #lead 
+  ungroup() %>% select(-spot)
+mo %>% ggplot(aes(x=Date,y=momentum, col=ticker)) + 
+  geom_line(alpha=0.6) + ggtitle("Momentum Indicator")
+```
+
+Naively, how well does that do as a predictor for t+1?
+```{r mo_lm}
+mo %>% full_join(nrg %>% drop_na(), by=c("Date", "ticker")) %>%
+  group_by(ticker) %>% 
+  mutate(momentum=lag(momentum), spot=log(spot)-lag(log(spot))) %>% 
+  do(tidy(lm(spot~momentum,.)))
+```
+Not very well. In fact, it's a minor mean reversion indicator. I will once again plead time constraints and try it for these currency pairs anyway. We need to turn this into two sets of indicators, one for CAD and one for NOK and RUB. I'm just going to weight oil and natural gas equally.
+
+```{r agg_mo}
+agg_mo <- mo %>% spread(ticker, momentum) %>%
+  drop_na() %>% #We won't do na.locf here, but will instead only produce the indicator on days we have data for all series.
+  mutate(west=WTI + HenryHub,
+         east=Brent + HenryHub) %>%
+  select(Date,west,east) 
+agg_mo %>% gather(series, value, -Date) %>% 
+  ggplot(aes(x=Date, y=value, col=series)) + geom_line(alpha=0.5) +
+  ggtitle("Aggregated Energy Momentum Indicators")
+```
+Not much difference anyway. I see some gaps in the data
+
+## Co-integration with currency pairs
+
+The indicators are not exactly stationary, but I doubt we'll see co-integration against currency spot levels. I would typically do all my modeling against currency returns, as investors are not concerned with currency levels.
+
+I'll use Pfaff's implementation of Augmented Dickey-Fuller in the `urca` package. This will be against the residuals of a *contemporaneous* regression, not a prediction. 
+
+### NOKUSD
+```{r cointegration_nokusd}
+library(urca)
+
+#NOKUSD
+contemp <- full_join(fx %>% filter(ticker=="NOKUSD") %>%
+                          select(-ticker),
+                        agg_mo %>% select(-west),
+                        by="Date") %>% drop_na()
+fit_nokusd <- lm(spot~east, data=contemp)
+summary(urca::ur.df(resid(fit_nokusd), lags=3))
+```
+No.
+
+### NOKSEK
+```{r cointegration_noksek}
+contemp <- full_join(fx %>% filter(ticker=="NOKSEK") %>%
+                          select(-ticker),
+                        agg_mo %>% select(-west),
+                        by="Date") %>% drop_na()
+fit_noksek <- lm(spot~east, data=contemp)
+summary(urca::ur.df(resid(fit_noksek), lags=3))
+```
+No.
+
+### CADUSD
+```{r cointegration_cadusd}
+contemp <- full_join(fx %>% filter(ticker=="CADUSD") %>%
+                          select(-ticker),
+                        agg_mo %>% select(-east),
+                        by="Date") %>% drop_na()
+fit_cadusd <- lm(spot~west, data=contemp)
+summary(urca::ur.df(resid(fit_cadusd), lags=3))
+```
+Yes. We can't reject the null hypothesis that there's a unit root.
+
+### RUBUSD
+```{r cointegration_rubusd}
+contemp <- full_join(fx %>% filter(ticker=="RUBUSD") %>%
+                          select(-ticker),
+                        agg_mo %>% select(-west),
+                        by="Date") %>% drop_na()
+fit_rubusd <- lm(spot~east, data=contemp)
+summary(urca::ur.df(resid(fit_rubusd), lags=3))
+```
+Yes. RUB looks to be cointegrated as well.
+
+## Trading Strategy
+
+Let's see if the indicators have any predictive power for daily spot returns. The first thing to do is to look at the scatter plots.
+
+```{r pred_data}
+pred <- full_join(fx %>% group_by(ticker) %>%
+                    mutate(spot_ret=log(spot) - lag(log(spot))) %>%
+                    ungroup() %>% select(-spot) %>%
+                    spread(ticker, spot_ret), 
+                  agg_mo, by="Date") %>%
+  mutate_at(vars(west, east), funs(lag(.)))
+```
+
+### NOKUSD
+```{r g_Nokusd}
+pred %>% select(NOKUSD,east) %>% drop_na() %>%
+  ggplot(aes(y=NOKUSD, x=east)) + geom_point() + geom_smooth(method="lm")
+```
+Well, that's discouraging. You can see the usual fat tails for currency returns. It is a big mistake to take these out, because the do occur and can make or break currency CTAs.
+
+### NOKSEK
+```{r g_NokSek}
+pred %>% select(NOKSEK,east) %>% drop_na() %>%
+  ggplot(aes(y=NOKSEK, x=east)) + geom_point() + geom_smooth(method="lm")
+```
+NOKSEK is no better, although the tails have come in a great deal, as NOK and SEK are more similar currencies than NOK and USD.
+
+### CADUSD
+```{r g_cadusd}
+pred %>% select(CADUSD,west) %>% drop_na() %>%
+  ggplot(aes(y=CADUSD, x=west)) + geom_point() + geom_smooth(method="lm")
+```
+### RUBUSD
+```{r g_rubusd}
+pred %>% select(RUBUSD,east) %>% drop_na() %>%
+  ggplot(aes(y=RUBUSD, x=east)) + geom_point() + geom_smooth(method="lm")
+```
+
+You can see a weak relationship on some of these. Probably the best periodicity for this indicator would be intraday, but that data is not freely available.
+
+I think you might be able to make the case that extreme values of the indicator should be traded, particularly on the downside. Since we know the indicators have some autocorrelation, we could develop a scale such that the trader legs in to the currencies after the indicator passes, say, 0.15 in either direction.
+
+How about 
+$$
+wgt_x = \begin{Bmatrix}
+5 * (I_x - 0.15) & I_x >= 0\\ 
+5 * (I_x + 0.15) & I_x < 0
+\end{Bmatrix}
+$$ 
+
+You could argue for more aggressive legs, or different leverage, but this is an ok start. Let's see if it works for any of these pairs. 
+
+### Backtesting
+I'm going to once again take the massive shortcut of just multiplying weights by returns, which holds our total capital constant but saves me having to code up a proper accounting system. This shortcut is going to underestimate the cumulative return of the strategy, but we should at least get a sense of which direction it would go.
+
+```{r wgts}
+L = 5 #leverage
+wgts <- pred %>% mutate(wgt_east = ifelse(east>=0, L*east-0.15, L*east+0.15),
+                        wgt_east = ifelse(abs(east)-0.15 > 0,wgt_east, 0),
+                        wgt_west = ifelse(west>=0, L*west-0.15, L*west+0.15),
+                        wgt_west = ifelse(abs(west)-0.15 > 0,wgt_west, 0)) %>%
+        select(Date,wgt_east, wgt_west) %>% 
+        rename(east=wgt_east, west=wgt_west) %>%
+        gather(series, wgt, -Date) %>% drop_na()
+wgts %>% ggplot(aes(x=Date,y=wgt, col=series)) + geom_line(alpha=0.65)
+```
+
+I'm not attempting an optimized portfolio here. Just treating each currency pair as independent.
+
+```{r}
+returns <- full_join(pred %>% select(-west, -east), 
+                     wgts %>% spread(series, wgt), by="Date") %>%
+          mutate(CADUSD = CADUSD*west) %>%
+          mutate_at(vars(NOKSEK,NOKUSD,RUBUSD), funs(.*east)) %>%
+  select(-east, -west) %>% gather(ticker,return,-Date) %>% drop_na()
+returns %>% ggplot(aes(x=Date,y=cumsum(return), col=ticker)) + geom_line() + 
+  ggtitle("Aggregate return of trading strategy by Currency Pair")
+```
+So, the extreme values we were looking at were concentrated in the credit crisis and during the commodity collapse and subsequent geopolitical unrest. This indicator did not work out as I had hoped.
